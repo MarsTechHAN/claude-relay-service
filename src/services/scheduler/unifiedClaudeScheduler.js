@@ -8,6 +8,7 @@ const logger = require('../../utils/logger')
 const { parseVendorPrefixedModel, isOpus45OrNewer } = require('../../utils/modelHelper')
 const { isSchedulable, sortAccountsByPriority } = require('../../utils/commonHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const tokenRefreshService = require('../tokenRefreshService')
 
 /**
  * Check if account is Pro (not Max)
@@ -1316,6 +1317,16 @@ class UnifiedClaudeScheduler {
 
   // 🔍 检查账户是否临时不可用
   async isAccountTemporarilyUnavailable(accountId, accountType) {
+    if (accountType === 'claude-official') {
+      const refreshCooldown = await tokenRefreshService.getRefreshCooldown(accountId, 'claude')
+      if (refreshCooldown.active) {
+        logger.debug(
+          `⏳ Claude OAuth account ${accountId} skipped due to token refresh cooldown (${refreshCooldown.ttlSeconds}s remaining)`
+        )
+        return true
+      }
+    }
+
     return upstreamErrorHelper.isTempUnavailable(accountId, accountType)
   }
 

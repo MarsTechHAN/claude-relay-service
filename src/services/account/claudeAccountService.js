@@ -7,6 +7,8 @@ const config = require('../../../config/config')
 const logger = require('../../utils/logger')
 const { maskToken } = require('../../utils/tokenMask')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const { OAUTH_CONFIG } = require('../../utils/oauthHelper')
+const { postOAuthTokenRequest } = require('../../utils/oauthTokenHttpClient')
 const {
   logRefreshStart,
   logRefreshSuccess,
@@ -23,6 +25,111 @@ const {
   normalizeOptionalNonNegativeInteger,
   normalizeTempUnavailablePolicyInput
 } = require('../../utils/tempUnavailablePolicy')
+
+const OAUTH_SCOPE_ORG_CREATE_API_KEY = 'org:create_api_key'
+const DEFAULT_REFRESH_COOLDOWN_SECONDS = parseInt(
+  process.env.CLAUDE_OAUTH_REFRESH_COOLDOWN_SECONDS || '300',
+  10
+)
+const EXPIRED_ACCESS_TOKEN_FALLBACK_GRACE_MS = 5 * 60 * 1000
+
+function parseOAuthScopes(scopes) {
+  if (Array.isArray(scopes)) {
+    return scopes.map((scope) => String(scope).trim()).filter(Boolean)
+  }
+
+  if (typeof scopes === 'string') {
+    return scopes
+      .split(/\s+/)
+      .map((scope) => scope.trim())
+      .filter(Boolean)
+  }
+
+  return []
+}
+
+function uniqueOAuthScopes(scopes) {
+  return scopes
+    .filter((scope) => scope !== OAUTH_SCOPE_ORG_CREATE_API_KEY)
+    .filter((scope, index, arr) => arr.indexOf(scope) === index)
+}
+
+function normalizeTokenValue(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function formatOAuthErrorData(errorData) {
+  if (!errorData) {
+    return ''
+  }
+
+  if (typeof errorData === 'string') {
+    return errorData
+  }
+
+  if (errorData.error && typeof errorData.error === 'object') {
+    const type = errorData.error.type || errorData.error.code || ''
+    const message = errorData.error.message || errorData.error_description || ''
+    return [type, message].filter(Boolean).join(': ')
+  }
+
+  if (typeof errorData.error === 'string') {
+    return [errorData.error, errorData.error_description].filter(Boolean).join(': ')
+  }
+
+  if (errorData.message) {
+    return String(errorData.message)
+  }
+
+  try {
+    return JSON.stringify(errorData)
+  } catch {
+    return String(errorData)
+  }
+}
+
+function getOAuthErrorCode(error) {
+  const data = error?.response?.data
+  if (data?.error && typeof data.error === 'object') {
+    return data.error.type || data.error.code || ''
+  }
+  if (typeof data?.error === 'string') {
+    return data.error
+  }
+  return error?.oauthError || ''
+}
+
+function isInvalidGrantError(error) {
+  const code = getOAuthErrorCode(error)
+  return (
+    code === 'invalid_grant' ||
+    (typeof error?.message === 'string' && error.message.includes('invalid_grant'))
+  )
+}
+
+function isTransientRefreshError(error) {
+  const statusCode = Number(error?.statusCode || error?.response?.status || 0)
+  if (statusCode === 429 || statusCode >= 500) {
+    return true
+  }
+
+  return ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN'].includes(
+    error?.code
+  )
+}
+
+function getRefreshCooldownSeconds(error) {
+  const retryAfter = upstreamErrorHelper.parseRetryAfter(error?.response?.headers)
+  if (retryAfter && retryAfter > 0) {
+    return retryAfter
+  }
+  if (error?.retryAfterSeconds && error.retryAfterSeconds > 0) {
+    return error.retryAfterSeconds
+  }
+  return Number.isFinite(DEFAULT_REFRESH_COOLDOWN_SECONDS)
+    ? Math.max(1, DEFAULT_REFRESH_COOLDOWN_SECONDS)
+    : 300
+}
 
 /**
  * Check if account is Pro (not Max)
@@ -270,10 +377,32 @@ class ClaudeAccountService {
         throw new Error('Account not found')
       }
 
-      const refreshToken = this._decryptSensitiveData(accountData.refreshToken)
+      const refreshToken = normalizeTokenValue(this._decryptSensitiveData(accountData.refreshToken))
+      const oauthPayload = this._safeParseJson(this._decryptSensitiveData(accountData.claudeAiOauth)) || {}
+      const oauthRefreshToken = normalizeTokenValue(oauthPayload.refreshToken)
+      const refreshCandidates = []
 
-      if (!refreshToken) {
+      if (refreshToken) {
+        refreshCandidates.push({ source: 'account', token: refreshToken })
+      }
+      if (oauthRefreshToken && oauthRefreshToken !== refreshToken) {
+        refreshCandidates.push({ source: 'claudeAiOauth', token: oauthRefreshToken })
+      }
+
+      if (refreshCandidates.length === 0) {
         throw new Error('No refresh token available - manual token update required')
+      }
+
+      const cooldown = await tokenRefreshService.getRefreshCooldown(accountId, 'claude')
+      if (cooldown.active) {
+        logRefreshSkipped(accountId, accountData.name, 'claude', 'refresh_cooldown')
+        const cooldownError = new Error(
+          `Token refresh temporarily cooling down; retry after ${cooldown.ttlSeconds}s`
+        )
+        cooldownError.statusCode = 429
+        cooldownError.temporary = true
+        cooldownError.skipStatusUpdate = true
+        throw cooldownError
       }
 
       // 尝试获取分布式锁
@@ -314,10 +443,10 @@ class ClaudeAccountService {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json, text/plain, */*',
-          'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+          'User-Agent': OAUTH_CONFIG.USER_AGENT,
           'Accept-Language': 'en-US,en;q=0.9',
-          Referer: 'https://claude.ai/',
-          Origin: 'https://claude.ai'
+          Referer: `${OAUTH_CONFIG.AUTHORIZE_ORIGIN}/`,
+          Origin: OAUTH_CONFIG.AUTHORIZE_ORIGIN
         },
         timeout: 30000
       }
@@ -328,15 +457,52 @@ class ClaudeAccountService {
         axiosConfig.proxy = false
       }
 
-      const response = await axios.post(
-        this.claudeApiUrl,
-        {
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken,
-          client_id: this.claudeOauthClientId
-        },
-        axiosConfig
-      )
+      let response
+      let refreshTokenUsed = refreshCandidates[0].token
+
+      for (let index = 0; index < refreshCandidates.length; index++) {
+        const candidate = refreshCandidates[index]
+        try {
+          response = await postOAuthTokenRequest(
+            this.claudeApiUrl,
+            {
+              grant_type: 'refresh_token',
+              refresh_token: candidate.token,
+              client_id: this.claudeOauthClientId
+            },
+            axiosConfig
+          )
+          refreshTokenUsed = candidate.token
+          if (index > 0) {
+            logger.warn(
+              `⚠️ Claude OAuth refresh recovered with ${candidate.source} token for account ${accountId}`
+            )
+          }
+          break
+        } catch (requestError) {
+          if (requestError.response) {
+            const { status, data, headers } = requestError.response
+            const detail = formatOAuthErrorData(data)
+            const sanitizedError = new Error(
+              `Token refresh failed: HTTP ${status}${detail ? `: ${detail}` : ''}`
+            )
+            sanitizedError.statusCode = status
+            sanitizedError.oauthError = getOAuthErrorCode(requestError)
+            sanitizedError.response = { status, data, headers }
+            sanitizedError.retryAfterSeconds = upstreamErrorHelper.parseRetryAfter(headers)
+
+            if (isInvalidGrantError(sanitizedError) && index < refreshCandidates.length - 1) {
+              logger.warn(
+                `⚠️ Claude OAuth refresh failed with ${candidate.source} token for account ${accountId}; trying next stored token source`
+              )
+              continue
+            }
+
+            throw sanitizedError
+          }
+          throw requestError
+        }
+      }
 
       if (response.status === 200) {
         // 记录完整的响应数据到专门的认证详细日志
@@ -350,6 +516,15 @@ class ClaudeAccountService {
         })
 
         const { access_token, refresh_token, expires_in } = response.data
+
+        if (!access_token || !expires_in) {
+          throw new Error('Token refresh failed: response missing access_token or expires_in')
+        }
+
+        const nextRefreshToken = normalizeTokenValue(refresh_token) || refreshTokenUsed
+        const refreshedScopes = uniqueOAuthScopes(
+          parseOAuthScopes(response.data.scope || accountData.scopes || oauthPayload.scopes)
+        )
 
         // 检查是否有套餐信息
         if (
@@ -372,15 +547,29 @@ class ClaudeAccountService {
           accountData.subscriptionInfo = JSON.stringify(subscriptionInfo)
         }
 
-        // 更新账户数据
+        // 更新账户数据；refresh_token 可能不轮换，未返回时保留旧值。
         accountData.accessToken = this._encryptSensitiveData(access_token)
-        accountData.refreshToken = this._encryptSensitiveData(refresh_token)
+        accountData.refreshToken = this._encryptSensitiveData(nextRefreshToken)
         accountData.expiresAt = (Date.now() + expires_in * 1000).toString()
+        if (refreshedScopes.length > 0) {
+          accountData.scopes = refreshedScopes.join(' ')
+        }
         accountData.lastRefreshAt = new Date().toISOString()
         accountData.status = 'active'
         accountData.errorMessage = ''
+        accountData.claudeAiOauth = this._encryptSensitiveData(
+          JSON.stringify({
+            ...oauthPayload,
+            accessToken: access_token,
+            refreshToken: nextRefreshToken,
+            expiresAt: Number(accountData.expiresAt),
+            scopes:
+              refreshedScopes.length > 0 ? refreshedScopes : parseOAuthScopes(accountData.scopes)
+          })
+        )
 
         await redis.setClaudeAccount(accountId, accountData)
+        await tokenRefreshService.clearRefreshCooldown(accountId, 'claude')
 
         // 刷新成功后，如果有 user:profile 权限，尝试获取账号 profile 信息
         // 检查账户的 scopes 是否包含 user:profile（标准 OAuth 有，Setup Token 没有）
@@ -401,7 +590,7 @@ class ClaudeAccountService {
         // 记录刷新成功
         logRefreshSuccess(accountId, accountData.name, 'claude', {
           accessToken: access_token,
-          refreshToken: refresh_token,
+          refreshToken: nextRefreshToken,
           expiresAt: accountData.expiresAt,
           scopes: accountData.scopes
         })
@@ -422,10 +611,37 @@ class ClaudeAccountService {
       // 记录刷新失败
       const accountData = await redis.getClaudeAccount(accountId)
       if (accountData) {
-        logRefreshError(accountId, accountData.name, 'claude', error)
+        if (!error.skipStatusUpdate) {
+          logRefreshError(accountId, accountData.name, 'claude', error)
+        }
+
+        const transientRefreshError = isTransientRefreshError(error)
+        if (transientRefreshError) {
+          const ttlSeconds = getRefreshCooldownSeconds(error)
+          await tokenRefreshService.setRefreshCooldown(
+            accountId,
+            'claude',
+            ttlSeconds,
+            error.message
+          )
+          accountData.status = 'active'
+          accountData.errorMessage = ''
+          accountData.lastRefreshAt = new Date().toISOString()
+          await redis.setClaudeAccount(accountId, accountData)
+          upstreamErrorHelper
+            .recordErrorHistory(accountId, 'claude-official', error.statusCode || 0, 'token_refresh_transient_failed', {
+              errorBody: error.message,
+              cooldownSeconds: ttlSeconds
+            })
+            .catch(() => {})
+        }
 
         // disableAutoProtection 检查：跳过状态修改，仅记录日志和错误历史
-        if (
+        if (transientRefreshError || error.skipStatusUpdate) {
+          logger.warn(
+            `⏳ Token refresh for ${accountData.name} (${accountId}) failed with transient error; keeping account active and relying on refresh cooldown`
+          )
+        } else if (
           accountData.disableAutoProtection === true ||
           accountData.disableAutoProtection === 'true'
         ) {
@@ -444,18 +660,20 @@ class ClaudeAccountService {
         }
 
         // 发送Webhook通知
-        try {
-          const webhookNotifier = require('../../utils/webhookNotifier')
-          await webhookNotifier.sendAccountAnomalyNotification({
-            accountId,
-            accountName: accountData.name,
-            platform: 'claude-oauth',
-            status: 'error',
-            errorCode: 'CLAUDE_OAUTH_ERROR',
-            reason: `Token refresh failed: ${error.message}`
-          })
-        } catch (webhookError) {
-          logger.error('Failed to send webhook notification:', webhookError)
+        if (!transientRefreshError && !error.skipStatusUpdate) {
+          try {
+            const webhookNotifier = require('../../utils/webhookNotifier')
+            await webhookNotifier.sendAccountAnomalyNotification({
+              accountId,
+              accountName: accountData.name,
+              platform: 'claude-oauth',
+              status: 'error',
+              errorCode: 'CLAUDE_OAUTH_ERROR',
+              reason: `Token refresh failed: ${error.message}`
+            })
+          } catch (webhookError) {
+            logger.error('Failed to send webhook notification:', webhookError)
+          }
         }
       }
 
@@ -516,10 +734,14 @@ class ClaudeAccountService {
           logger.warn(`⚠️ Token refresh failed for account ${accountId}: ${refreshError.message}`)
           // 如果刷新失败，仍然尝试使用当前token（可能是手动添加的长期有效token）
           const currentToken = this._decryptSensitiveData(accountData.accessToken)
-          if (currentToken) {
+          const expiredForMs = expiresAt ? now - expiresAt : Number.POSITIVE_INFINITY
+          if (currentToken && expiredForMs <= EXPIRED_ACCESS_TOKEN_FALLBACK_GRACE_MS) {
             logger.info(`🔄 Using current token for account ${accountId} (refresh failed)`)
             return currentToken
           }
+          logger.warn(
+            `⏭️ Skipping current token fallback for account ${accountId} because stored access token is beyond fallback grace`
+          )
           throw refreshError
         }
       }
@@ -761,7 +983,9 @@ class ClaudeAccountService {
       let extInfoProvided = false
 
       // 检查是否新增了 refresh token
-      const oldRefreshToken = this._decryptSensitiveData(accountData.refreshToken)
+      const oldRefreshToken = normalizeTokenValue(this._decryptSensitiveData(accountData.refreshToken))
+      const existingOauthPayload =
+        this._safeParseJson(this._decryptSensitiveData(accountData.claudeAiOauth)) || {}
 
       for (const [field, value] of Object.entries(updates)) {
         if (allowedUpdates.includes(field)) {
@@ -792,11 +1016,42 @@ class ClaudeAccountService {
           } else if (field === 'claudeAiOauth') {
             // 更新 Claude AI OAuth 数据
             if (value) {
-              updatedData.claudeAiOauth = this._encryptSensitiveData(JSON.stringify(value))
-              updatedData.accessToken = this._encryptSensitiveData(value.accessToken)
-              updatedData.refreshToken = this._encryptSensitiveData(value.refreshToken)
-              updatedData.expiresAt = value.expiresAt.toString()
-              updatedData.scopes = value.scopes.join(' ')
+              const accessToken =
+                normalizeTokenValue(value.accessToken) ||
+                normalizeTokenValue(existingOauthPayload.accessToken) ||
+                normalizeTokenValue(this._decryptSensitiveData(accountData.accessToken))
+              const refreshToken =
+                normalizeTokenValue(value.refreshToken) ||
+                normalizeTokenValue(existingOauthPayload.refreshToken) ||
+                normalizeTokenValue(this._decryptSensitiveData(accountData.refreshToken))
+              const scopes = parseOAuthScopes(
+                value.scopes || existingOauthPayload.scopes || accountData.scopes
+              )
+              const expiresAt =
+                value.expiresAt ||
+                existingOauthPayload.expiresAt ||
+                accountData.expiresAt ||
+                Date.now() + 10 * 60 * 1000
+              const mergedOauthPayload = {
+                ...existingOauthPayload,
+                ...value,
+                accessToken,
+                refreshToken,
+                expiresAt: Number(expiresAt),
+                scopes
+              }
+
+              updatedData.claudeAiOauth = this._encryptSensitiveData(
+                JSON.stringify(mergedOauthPayload)
+              )
+              if (accessToken) {
+                updatedData.accessToken = this._encryptSensitiveData(accessToken)
+              }
+              if (refreshToken) {
+                updatedData.refreshToken = this._encryptSensitiveData(refreshToken)
+              }
+              updatedData.expiresAt = expiresAt.toString()
+              updatedData.scopes = scopes.join(' ')
               updatedData.status = 'active'
               updatedData.errorMessage = ''
               updatedData.lastRefreshAt = new Date().toISOString()
@@ -811,6 +1066,21 @@ class ClaudeAccountService {
           } else {
             updatedData[field] = value !== null && value !== undefined ? value.toString() : ''
           }
+        }
+      }
+
+      if (Object.prototype.hasOwnProperty.call(updates, 'refreshToken')) {
+        const nextRefreshToken = normalizeTokenValue(updates.refreshToken)
+        if (nextRefreshToken) {
+          const syncedOauthPayload = {
+            ...existingOauthPayload,
+            refreshToken: nextRefreshToken,
+            expiresAt: Number(updatedData.expiresAt || Date.now() + 10 * 60 * 1000),
+            scopes: parseOAuthScopes(
+              existingOauthPayload.scopes || accountData.scopes || OAUTH_CONFIG.SCOPES_API
+            )
+          }
+          updatedData.claudeAiOauth = this._encryptSensitiveData(JSON.stringify(syncedOauthPayload))
         }
       }
 

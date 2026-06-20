@@ -7,6 +7,7 @@ const crypto = require('crypto')
 const ProxyHelper = require('./proxyHelper')
 const axios = require('axios')
 const logger = require('./logger')
+const { postOAuthTokenRequest } = require('./oauthTokenHttpClient')
 
 // OAuth 配置常量 - 从claude-code-login.js提取
 // 注：console.anthropic.com 已迁移至 platform.claude.com，旧域名对 refresh_token grant 返回 404
@@ -15,6 +16,8 @@ const OAUTH_CONFIG = {
   TOKEN_URL: 'https://platform.claude.com/v1/oauth/token',
   CLIENT_ID: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
   REDIRECT_URI: 'https://platform.claude.com/oauth/code/callback',
+  AUTHORIZE_ORIGIN: 'https://claude.ai',
+  USER_AGENT: process.env.CLAUDE_OAUTH_USER_AGENT || 'axios/1.13.6',
   SCOPES:
     'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
   // Cookie/API 流程使用的 scope（不含 org:create_api_key，该 scope 仅适用于浏览器授权）
@@ -189,11 +192,11 @@ async function exchangeCodeForTokens(authorizationCode, codeVerifier, state, pro
     const axiosConfig = {
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+        'User-Agent': OAUTH_CONFIG.USER_AGENT,
         Accept: 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
-        Referer: 'https://claude.ai/',
-        Origin: 'https://claude.ai'
+        Referer: `${OAUTH_CONFIG.AUTHORIZE_ORIGIN}/`,
+        Origin: OAUTH_CONFIG.AUTHORIZE_ORIGIN
       },
       timeout: 30000
     }
@@ -204,7 +207,7 @@ async function exchangeCodeForTokens(authorizationCode, codeVerifier, state, pro
       axiosConfig.proxy = false
     }
 
-    const response = await axios.post(OAUTH_CONFIG.TOKEN_URL, params, axiosConfig)
+    const response = await postOAuthTokenRequest(OAUTH_CONFIG.TOKEN_URL, params, axiosConfig)
 
     // 记录完整的响应数据到专门的认证详细日志
     logger.authDetail('OAuth token exchange response', response.data)
@@ -409,11 +412,11 @@ async function exchangeSetupTokenCode(authorizationCode, codeVerifier, state, pr
     const axiosConfig = {
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+        'User-Agent': OAUTH_CONFIG.USER_AGENT,
         Accept: 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
-        Referer: 'https://claude.ai/',
-        Origin: 'https://claude.ai'
+        Referer: `${OAUTH_CONFIG.AUTHORIZE_ORIGIN}/`,
+        Origin: OAUTH_CONFIG.AUTHORIZE_ORIGIN
       },
       timeout: 30000
     }
@@ -424,7 +427,7 @@ async function exchangeSetupTokenCode(authorizationCode, codeVerifier, state, pr
       axiosConfig.proxy = false
     }
 
-    const response = await axios.post(OAUTH_CONFIG.TOKEN_URL, params, axiosConfig)
+    const response = await postOAuthTokenRequest(OAUTH_CONFIG.TOKEN_URL, params, axiosConfig)
 
     // 记录完整的响应数据到专门的认证详细日志
     logger.authDetail('Setup Token exchange response', response.data)

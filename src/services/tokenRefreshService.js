@@ -10,6 +10,7 @@ class TokenRefreshService {
   constructor() {
     this.lockTTL = 60 // 锁的TTL: 60秒（token刷新通常在30秒内完成）
     this.lockValue = new Map() // 存储每个锁的唯一值
+    this.cooldownPrefix = 'token_refresh_cooldown'
   }
 
   /**
@@ -124,6 +125,81 @@ class TokenRefreshService {
     } catch (error) {
       logger.error(`Failed to get lock TTL ${lockKey}:`, error)
       return -1
+    }
+  }
+
+  _getCooldownKey(accountId, platform = 'claude') {
+    return `${this.cooldownPrefix}:${platform}:${accountId}`
+  }
+
+  /**
+   * 设置刷新冷却，避免上游 OAuth endpoint 429/5xx 时被请求路径反复打爆。
+   */
+  async setRefreshCooldown(accountId, platform = 'claude', ttlSeconds = 300, reason = '') {
+    const key = this._getCooldownKey(accountId, platform)
+    const ttl = Math.max(1, Math.ceil(Number(ttlSeconds) || 300))
+
+    try {
+      const client = redis.getClientSafe()
+      const payload = JSON.stringify({
+        reason,
+        createdAt: new Date().toISOString(),
+        ttlSeconds: ttl
+      })
+      await client.setex(key, ttl, payload)
+      logger.warn(
+        `⏳ Set token refresh cooldown for ${platform}:${accountId}, ttl=${ttl}s, reason=${reason || 'unknown'}`
+      )
+      return { active: true, ttlSeconds: ttl, reason }
+    } catch (error) {
+      logger.error(`Failed to set refresh cooldown ${key}:`, error)
+      return { active: false, ttlSeconds: 0, reason }
+    }
+  }
+
+  /**
+   * 获取刷新冷却状态。
+   */
+  async getRefreshCooldown(accountId, platform = 'claude') {
+    const key = this._getCooldownKey(accountId, platform)
+
+    try {
+      const client = redis.getClientSafe()
+      const ttl = await client.ttl(key)
+      if (!ttl || ttl <= 0) {
+        return { active: false, ttlSeconds: 0 }
+      }
+
+      let data = {}
+      try {
+        data = JSON.parse((await client.get(key)) || '{}')
+      } catch {
+        data = {}
+      }
+
+      return {
+        active: true,
+        ttlSeconds: ttl,
+        reason: data.reason || '',
+        createdAt: data.createdAt || null
+      }
+    } catch (error) {
+      logger.error(`Failed to get refresh cooldown ${key}:`, error)
+      return { active: false, ttlSeconds: 0 }
+    }
+  }
+
+  /**
+   * 清理刷新冷却。
+   */
+  async clearRefreshCooldown(accountId, platform = 'claude') {
+    const key = this._getCooldownKey(accountId, platform)
+
+    try {
+      const client = redis.getClientSafe()
+      await client.del(key)
+    } catch (error) {
+      logger.error(`Failed to clear refresh cooldown ${key}:`, error)
     }
   }
 
