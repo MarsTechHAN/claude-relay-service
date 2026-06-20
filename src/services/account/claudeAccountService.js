@@ -616,7 +616,7 @@ class ClaudeAccountService {
         }
 
         const transientRefreshError = isTransientRefreshError(error)
-        if (transientRefreshError) {
+        if (transientRefreshError && !error.skipStatusUpdate) {
           const ttlSeconds = getRefreshCooldownSeconds(error)
           await tokenRefreshService.setRefreshCooldown(
             accountId,
@@ -677,7 +677,11 @@ class ClaudeAccountService {
         }
       }
 
-      logger.error(`❌ Failed to refresh token for account ${accountId}:`, error)
+      if (error.skipStatusUpdate) {
+        logger.warn(`⏳ Skipped token refresh for account ${accountId}: ${error.message}`)
+      } else {
+        logger.error(`❌ Failed to refresh token for account ${accountId}:`, error)
+      }
 
       throw error
     } finally {
